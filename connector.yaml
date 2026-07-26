@@ -1,0 +1,130 @@
+version: "1.0"
+specification:
+  name: pgvector
+  summary: Conduit destination connector for pgvector (Postgres vector store).
+  description: |
+    The pgvector destination connector is the flagship vector sink for Conduit's
+    AI data pipeline (CDC -> chunk -> embed -> pgvector), keeping a RAG index
+    fresh from Postgres.
+
+    It is a write-only connector. Each incoming embedding record is upserted into
+    a pgvector table keyed by the record's stable key (the chunk_id), using
+    `INSERT ... ON CONFLICT (<key>) DO UPDATE`, so at-least-once redelivery
+    converges to a single row rather than duplicating it.
+
+    At pipeline start the connector validates the configured embedding
+    `dimension` against the target table's `vector` column and fails fast with a
+    stable, actionable error (`ai.vector_dimension_mismatch`) if they disagree,
+    instead of failing silently on the first write.
+  version: (devel)
+  author: Meroxa, Inc.
+  destination:
+    parameters:
+      - name: dimension
+        description: |-
+          Dimension is the embedding dimension the upstream model produces. It is
+          validated against the target table's vector column at pipeline start
+          (fail fast). There is no safe default, so it is required.
+        type: int
+        default: ""
+        validations:
+          - type: required
+            value: ""
+      - name: url
+        description: URL is the connection string for the target Postgres/pgvector database.
+        type: string
+        default: ""
+        validations:
+          - type: required
+            value: ""
+      - name: keyColumn
+        description: |-
+          KeyColumn is the primary-key column used as the ON CONFLICT target for
+          idempotent upserts. It holds the record's stable chunk_id.
+        type: string
+        default: id
+        validations: []
+      - name: metadataColumn
+        description: |-
+          MetadataColumn is the JSONB column that receives the record's metadata.
+          Leave empty to disable metadata writes.
+        type: string
+        default: metadata
+        validations: []
+      - name: table
+        description: |-
+          Table is the target table into which embedding rows are upserted.
+          Supports a Go template evaluated per record (default: the record's
+          OpenCDC collection), matching the Postgres connector's convention.
+        type: string
+        default: '{{ index .Metadata "opencdc.collection" }}'
+        validations: []
+      - name: vectorColumn
+        description: |-
+          VectorColumn is the name of the pgvector `vector` column on the target
+          table.
+        type: string
+        default: embedding
+        validations: []
+      - name: vectorField
+        description: |-
+          VectorField is the record payload field that carries the embedding
+          vector (a numeric array).
+        type: string
+        default: vector
+        validations: []
+      - name: sdk.batch.delay
+        description: Maximum delay before an incomplete batch is written to the destination.
+        type: duration
+        default: "0"
+        validations: []
+      - name: sdk.batch.size
+        description: Maximum size of batch before it gets written to the destination.
+        type: int
+        default: "0"
+        validations:
+          - type: greater-than
+            value: "-1"
+      - name: sdk.rate.burst
+        description: |-
+          Allow bursts of at most X records (0 or less means that bursts are not
+          limited). Only takes effect if a rate limit per second is set. Note that
+          if `sdk.batch.size` is bigger than `sdk.rate.burst`, the effective batch
+          size will be equal to `sdk.rate.burst`.
+        type: int
+        default: "0"
+        validations:
+          - type: greater-than
+            value: "-1"
+      - name: sdk.rate.perSecond
+        description: Maximum number of records written per second (0 means no rate limit).
+        type: float
+        default: "0"
+        validations:
+          - type: greater-than
+            value: "-1"
+      - name: sdk.record.format
+        description: |-
+          The format of the output record. See the Conduit documentation for a full
+          list of supported formats (https://conduit.io/docs/using/connectors/configuration-parameters/output-format).
+        type: string
+        default: opencdc/json
+        validations: []
+      - name: sdk.record.format.options
+        description: |-
+          Options to configure the chosen output record format. Options are normally
+          key=value pairs separated with comma (e.g. opt1=val2,opt2=val2), except
+          for the `template` record format, where options are a Go template.
+        type: string
+        default: ""
+        validations: []
+      - name: sdk.schema.extract.key.enabled
+        description: Whether to extract and decode the record key with a schema.
+        type: bool
+        default: "true"
+        validations: []
+      - name: sdk.schema.extract.payload.enabled
+        description: Whether to extract and decode the record payload with a schema.
+        type: bool
+        default: "true"
+        validations: []
