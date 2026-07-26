@@ -1,0 +1,15 @@
+services:
+  pgvector:
+    # Official pgvector image: Postgres with the vector extension preinstalled.
+    image: pgvector/pgvector:pg17
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-q", "-d", "conduit_test", "-U", "conduit" ]
+      timeout: 30s
+      interval: 5s
+      retries: 10
+    environment:
+      - POSTGRES_USER=conduit
+      - POSTGRES_PASSWORD=conduit
+      - POSTGRES_DB=conduit_test

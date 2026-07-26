@@ -1,0 +1,4 @@
+# Binary built with `make build`
+/conduit-connector-pgvector
+.DS_Store
+.idea/
