@@ -95,6 +95,38 @@ func GetVectorColumnInfo(ctx context.Context, q Querier, table, column string) (
 // to the appropriate stable connector error code with errors.Is.
 var ErrColumnNotFound = errors.New("target table or column not found")
 
+// HasSingleColumnUniqueConstraint reports whether the target table has a unique
+// index or constraint (including a primary key) on exactly the given single
+// column. This is the precondition for `INSERT ... ON CONFLICT (<column>)`: the
+// conflict target must be backed by a unique/exclusion constraint, otherwise
+// every upsert fails at execute time with "there is no unique or exclusion
+// constraint matching the ON CONFLICT specification". Checking it at Open lets
+// the connector fail fast with an actionable error instead.
+func HasSingleColumnUniqueConstraint(ctx context.Context, q Querier, table, column string) (bool, error) {
+	schema, tbl := splitSchemaTable(table)
+
+	const query = `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_index i
+			JOIN pg_class c ON c.oid = i.indrelid
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = i.indkey[0]
+			WHERE n.nspname = $1
+			  AND c.relname = $2
+			  AND i.indisunique
+			  AND i.indnkeyatts = 1
+			  AND a.attname = $3
+		)
+	`
+
+	var ok bool
+	if err := q.QueryRow(ctx, query, schema, tbl, column).Scan(&ok); err != nil {
+		return false, fmt.Errorf("failed checking unique constraint on %s.%s.%s: %w", schema, tbl, column, err)
+	}
+	return ok, nil
+}
+
 // splitSchemaTable splits a possibly schema-qualified table reference into its
 // schema and table parts, defaulting to the "public" schema. It intentionally
 // treats only the first dot as the separator; pgvector target tables are simple

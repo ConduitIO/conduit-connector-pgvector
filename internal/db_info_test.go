@@ -90,3 +90,42 @@ func TestGetVectorColumnInfo_ColumnNotFound(t *testing.T) {
 	_, err := internal.GetVectorColumnInfo(context.Background(), q, "docs", "embedding")
 	is.True(errors.Is(err, internal.ErrColumnNotFound))
 }
+
+// fakeBoolRow scans a single bool, for EXISTS-style queries.
+type fakeBoolRow struct {
+	val bool
+	err error
+}
+
+func (r fakeBoolRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	*dest[0].(*bool) = r.val
+	return nil
+}
+
+type fakeBoolQuerier struct {
+	row      fakeBoolRow
+	lastArgs []any
+}
+
+func (q *fakeBoolQuerier) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
+	q.lastArgs = args
+	return q.row
+}
+
+func TestHasSingleColumnUniqueConstraint(t *testing.T) {
+	is := is.New(t)
+
+	q := &fakeBoolQuerier{row: fakeBoolRow{val: true}}
+	ok, err := internal.HasSingleColumnUniqueConstraint(context.Background(), q, "rag.chunks", "id")
+	is.NoErr(err)
+	is.True(ok)
+	is.Equal(q.lastArgs, []any{"rag", "chunks", "id"})
+
+	q = &fakeBoolQuerier{row: fakeBoolRow{val: false}}
+	ok, err = internal.HasSingleColumnUniqueConstraint(context.Background(), q, "docs", "id")
+	is.NoErr(err)
+	is.True(!ok)
+}

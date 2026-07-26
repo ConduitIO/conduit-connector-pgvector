@@ -178,11 +178,30 @@ func (d *Destination) validateDimension(ctx context.Context, table string) error
 				internal.QuoteTable(table), internal.QuoteIdent(d.config.VectorColumn), d.config.Dimension))
 	}
 
+	// The upsert uses ON CONFLICT (keyColumn), which requires a single-column
+	// unique/PK constraint on that column. Verify it at Open so a missing
+	// constraint fails fast with an actionable error rather than failing every
+	// upsert at execute time. Only checkable for static tables (same deferral
+	// as the dimension check for templated tables).
+	hasUnique, err := internal.HasSingleColumnUniqueConstraint(ctx, d.conn, table, d.config.KeyColumn)
+	if err != nil {
+		return internal.NewCodedError(internal.CodeConnectionFailed, "failed to introspect the key column's constraints").
+			WithConfigPath("keyColumn").
+			Wrapping(err)
+	}
+	if !hasUnique {
+		return internal.NewCodedError(internal.CodeMissingUniqueConstraint,
+			fmt.Sprintf("key column %q on table %q has no single-column unique or primary-key constraint to back ON CONFLICT upserts", d.config.KeyColumn, table)).
+			WithConfigPath("keyColumn").
+			WithSuggestion(fmt.Sprintf("add a constraint, e.g. ALTER TABLE %s ADD PRIMARY KEY (%s), or point \"keyColumn\" at an existing unique/PK column",
+				internal.QuoteTable(table), internal.QuoteIdent(d.config.KeyColumn)))
+	}
+
 	sdk.Logger(ctx).Info().
 		Str("table", table).
 		Str("column", d.config.VectorColumn).
 		Int("dimension", info.Dimension).
-		Msg("vector dimension validated against target table")
+		Msg("vector dimension and key-column constraint validated against target table")
 	return nil
 }
 

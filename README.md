@@ -63,7 +63,20 @@ any statement fails, none are committed and the connector reports `0` records
 written so the engine can retry or route to the DLQ. **No record is acked
 before it is durably written** (data-integrity invariants 1 and 3).
 
-Delete records remove the row whose `keyColumn` equals the record key.
+### Deletes and the orphan caveat (read this before running RAG)
+
+Delete records remove the row whose `keyColumn` equals the record key
+(`chunk_id`). This is a **by-chunk-id delete only**. It does **not** yet remove
+all chunks derived from a source record by a `source_key` match.
+
+Concretely: if a source record is updated and re-chunked into **fewer** chunks
+than before (e.g. a document shrinks from 5 chunks to 3), the embeddings for the
+now-removed chunks (`…:3`, `…:4`) are **not** deleted and remain in the table —
+they stay retrievable by similarity search as stale/orphaned vectors. Deleting
+all chunks for a source record via a `source_key` metadata match (design doc
+§5's orphan-avoidance rule) is a planned later slice. Until then, operators must
+account for this (e.g. re-embed into a fresh table, or delete by `chunk_id`
+explicitly).
 
 ### Dimension validation at pipeline start (fail fast)
 
@@ -81,9 +94,16 @@ set "dimension" to 768 to match the table, or point "table" at a vector(1536)
 column, or migrate with ALTER TABLE "docs" ALTER COLUMN "embedding" TYPE vector(1536)
 ```
 
+At `Open` (for static tables) the connector also verifies that `keyColumn` has a
+single-column unique or primary-key constraint — the precondition for the
+`ON CONFLICT (<keyColumn>)` upsert. A missing constraint fails fast with
+`pgvector.missing_unique_constraint` instead of failing every upsert at execute
+time.
+
 When `table` is a Go template (resolved per record), the target cannot be
-introspected at startup; validation is deferred to a per-record dimension
-guard, which is logged at startup so the deferral is never hidden.
+introspected at startup; both the dimension check and the key-column constraint
+check are deferred (the dimension to a per-record guard), and the deferral is
+logged at startup so it is never hidden.
 
 ### Error codes
 
@@ -98,6 +118,7 @@ config path where known, and a suggested fix.
 | `pgvector.target_table_missing` | The configured `table` does not exist or is not visible to the connection role. |
 | `pgvector.vector_column_missing` | The configured `vectorColumn` does not exist on the target table. |
 | `pgvector.vector_column_type_mismatch` | The configured `vectorColumn` exists but is not a pgvector `vector` column. |
+| `pgvector.missing_unique_constraint` | `keyColumn` has no single-column unique/PK constraint to back the `ON CONFLICT` upsert. |
 | `pgvector.missing_vector_field` | A record carries no valid embedding vector in `vectorField`. |
 | `pgvector.missing_key` | A record has no usable key to derive the upsert conflict target. |
 | `pgvector.write_failed` | The batch upsert/delete failed to execute. |
@@ -234,7 +255,32 @@ running; it brings up a `pgvector/pgvector` Postgres via
 `test/docker-compose.yml`. Run `make test-unit` for the unit-only suite (no
 Docker required).
 
+Integration tests (dimension validation, upsert idempotency, delete,
+batch atomic-rollback, per-record dimension guard) are Docker-gated: they skip
+automatically when the test database is unreachable, so they execute in CI (and
+locally with `make test`) but are skipped in a Docker-less environment.
+
+### Acceptance suite (not yet wired — deferred to slice 2)
+
+The SDK's `sdk.AcceptanceTest` compatibility suite is **not** wired up yet. That
+harness is round-trip: it writes with the destination and reads back with a
+source, and it calls `t.Fatal` when `NewSource == nil`. This connector is
+destination-only, so the suite cannot run as-is. Wiring it — via a test-only
+pgvector source or a destination-subset driver — is a planned later slice.
+
 ## Delivery semantics
 
 At-least-once. Duplicate delivery is safe: upserts are idempotent by
-`chunk_id`. Deletes for a non-existent key are a no-op.
+`chunk_id`, and a batch is written in a single implicit transaction, so a
+partial failure rolls back the whole batch and nothing is acked. Deletes for a
+non-existent key are a no-op.
+
+**Table preconditions:** the target table must exist, the `pgvector` extension
+must be installed, `vectorColumn` must be a `vector(N)` column whose `N` equals
+the configured `dimension`, and `keyColumn` must have a single-column unique or
+primary-key constraint. For a static `table` these are all checked at pipeline
+start and fail fast with a coded error; for a templated `table` they are
+enforced per record at write time.
+
+**Orphaned embeddings:** deletes are by `chunk_id` only — see the orphan caveat
+under [Deletes](#deletes-and-the-orphan-caveat-read-this-before-running-rag).

@@ -61,6 +61,11 @@ const (
 	// exists but is not a pgvector `vector` column.
 	CodeVectorColumnTypeMismatch = "pgvector.vector_column_type_mismatch"
 
+	// CodeMissingUniqueConstraint is raised when the key column has no
+	// single-column unique/primary-key constraint to back the upsert's
+	// ON CONFLICT target.
+	CodeMissingUniqueConstraint = "pgvector.missing_unique_constraint"
+
 	// CodeMissingVectorField is raised when a record does not carry the
 	// configured embedding-vector field, or the field is not a numeric array.
 	CodeMissingVectorField = "pgvector.missing_vector_field"
@@ -147,9 +152,14 @@ func (e *CodedError) Unwrap() error {
 	return e.Err
 }
 
-// JSON returns the stable structured envelope for this error, suitable for a
-// `--json` CLI surface. The wrapped cause is flattened to its string form so
-// the envelope is always serializable.
+// JSON returns the stable structured envelope for this error. NOTE: this
+// connector is served as a gRPC plugin and has no CLI surface of its own, so
+// nothing in this repo renders errors as JSON today — errors reach the operator
+// as the Error() string via Conduit's own error reporting. JSON() is provided
+// for a future host/CLI that chooses to render coded connector errors
+// structurally; it is deliberately not claimed as a live `--json` surface here.
+// The wrapped cause is flattened to its string form so the envelope is always
+// serializable.
 func (e *CodedError) JSON() ([]byte, error) {
 	type envelope struct {
 		Code       string `json:"code"`

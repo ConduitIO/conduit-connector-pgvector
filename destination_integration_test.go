@@ -17,6 +17,7 @@ package pgvector
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/conduitio/conduit-commons/opencdc"
@@ -206,6 +207,56 @@ func TestDestination_PerRecordDimensionGuard(t *testing.T) {
 	n, err := d.Write(ctx, []opencdc.Record{rec})
 	is.Equal(n, 0)
 	assertCode(t, err, internal.CodeVectorDimensionMismatch)
+}
+
+// TestDestination_BatchAtomicRollback is the load-bearing invariant-1/3 test:
+// a batch of N valid records plus one record that fails AT POSTGRES (a CHECK
+// violation that passes the connector's local validation) must leave the table
+// empty — full-success-or-nothing, no partial write, and Write must report
+// (0, err) so nothing is acked. This exercises pgx's implicit-transaction
+// rollback across the batch, which the local-validation guard test cannot.
+func TestDestination_BatchAtomicRollback(t *testing.T) {
+	is := is.New(t)
+	ctx := test.Context(t)
+	conn := test.Connect(ctx, t)
+	test.EnsureExtension(ctx, t, conn)
+	table := test.RandomIdentifier(t)
+
+	// A CHECK on id rejects the literal 'BAD' at execute time. The connector's
+	// local validation (key present, vector length correct) passes, so the
+	// failure originates at Postgres — exactly the case the invariant covers.
+	_, err := conn.Exec(ctx, fmt.Sprintf(
+		`CREATE TABLE %s (id text PRIMARY KEY CHECK (id <> 'BAD'), embedding vector(4), metadata jsonb)`,
+		quoteForTest(table)))
+	is.NoErr(err)
+	t.Cleanup(func() {
+		_, _ = conn.Exec(context.Background(), "DROP TABLE IF EXISTS "+quoteForTest(table))
+	})
+
+	d := openDestination(ctx, t, map[string]string{
+		"url":       test.ConnString,
+		"table":     table,
+		"dimension": "4",
+	})
+	is.NoErr(d.Open(ctx))
+	defer func() { is.NoErr(d.Teardown(ctx)) }()
+
+	vec := []float32{0.1, 0.2, 0.3, 0.4}
+	recs := []opencdc.Record{
+		embeddingRecord(opencdc.OperationCreate, "good:0", vec, nil),
+		embeddingRecord(opencdc.OperationCreate, "good:1", vec, nil),
+		embeddingRecord(opencdc.OperationCreate, "BAD", vec, nil), // violates CHECK at Postgres
+	}
+
+	n, err := d.Write(ctx, recs)
+	is.Equal(n, 0) // nothing acked
+	assertCode(t, err, internal.CodeWriteFailed)
+
+	// Invariant 1/3: the two valid records must NOT have landed — the whole
+	// batch rolled back atomically.
+	var count int
+	is.NoErr(conn.QueryRow(ctx, "SELECT count(*) FROM "+quoteForTest(table)).Scan(&count))
+	is.Equal(count, 0)
 }
 
 // quoteForTest quotes an identifier for use in raw test SQL.
