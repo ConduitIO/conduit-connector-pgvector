@@ -72,3 +72,40 @@ func TestFormatVector(t *testing.T) {
 	is.Equal(internal.FormatVector([]float32{1, 2, 3}), "[1,2,3]")
 	is.Equal(internal.FormatVector(nil), "[]")
 }
+
+func TestParseVectorText(t *testing.T) {
+	is := is.New(t)
+	got, err := internal.ParseVectorText("[0.1,0.2,0.3]")
+	is.NoErr(err)
+	is.Equal(got, []float32{0.1, 0.2, 0.3})
+
+	got, err = internal.ParseVectorText("[1,2,3]")
+	is.NoErr(err)
+	is.Equal(got, []float32{1, 2, 3})
+
+	got, err = internal.ParseVectorText("[]")
+	is.NoErr(err)
+	is.Equal(got, []float32{})
+}
+
+func TestParseVectorText_Invalid(t *testing.T) {
+	is := is.New(t)
+	_, err := internal.ParseVectorText("not-a-vector")
+	is.True(err != nil)
+
+	_, err = internal.ParseVectorText("[0.1,oops,0.3]")
+	is.True(err != nil)
+}
+
+// TestFormatVector_ParseVectorText_RoundTrip proves FormatVector and
+// ParseVectorText are exact inverses for values that survive pgvector's
+// single-precision text codec unchanged — the property the upsert
+// idempotency test (TestDestination_Upsert_Idempotent) and the acceptance
+// suite's read-back (acceptanceDriver.ReadFromDestination) both depend on.
+func TestFormatVector_ParseVectorText_RoundTrip(t *testing.T) {
+	is := is.New(t)
+	want := []float32{0.25, 0.5, 0.75, 1, -2.5, 0}
+	got, err := internal.ParseVectorText(internal.FormatVector(want))
+	is.NoErr(err)
+	is.Equal(got, want)
+}

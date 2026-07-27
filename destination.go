@@ -89,7 +89,7 @@ func (d *Destination) Open(ctx context.Context) error {
 
 	sdk.Logger(ctx).Warn().
 		Str("table", d.config.Table).
-		Msg("target table is templated (resolved per record); deferring vector dimension validation to the per-record write guard")
+		Msg("target table is templated (resolved per record); deferring vector dimension validation to the per-record write guard, and skipping the key-column and source_key-column existence checks entirely (no per-record backstop for either) — a missing column surfaces as a raw Postgres error on first write instead of a coded one")
 	return nil
 }
 
@@ -129,10 +129,10 @@ func (d *Destination) validateDimension(ctx context.Context, table string) error
 		return internal.NewCodedError(internal.CodeTargetTableMissing,
 			fmt.Sprintf("target table %q does not exist or is not visible to the connection role", table)).
 			WithConfigPath("table").
-			WithSuggestion(fmt.Sprintf("create the table, e.g. CREATE TABLE %s (%s text PRIMARY KEY, %s vector(%d), %s jsonb)",
+			WithSuggestion(fmt.Sprintf("create the table, e.g. CREATE TABLE %s (%s text PRIMARY KEY, %s vector(%d), %s jsonb%s)",
 				internal.QuoteTable(table), internal.QuoteIdent(d.config.KeyColumn),
 				internal.QuoteIdent(d.config.VectorColumn), d.config.Dimension,
-				metadataColumnForHint(d.config.MetadataColumn)))
+				metadataColumnForHint(d.config.MetadataColumn), sourceKeyColumnForHint(d.config.SourceKeyColumn)))
 	}
 
 	info, err := internal.GetVectorColumnInfo(ctx, d.conn, table, d.config.VectorColumn)
@@ -195,6 +195,27 @@ func (d *Destination) validateDimension(ctx context.Context, table string) error
 			WithConfigPath("keyColumn").
 			WithSuggestion(fmt.Sprintf("add a constraint, e.g. ALTER TABLE %s ADD PRIMARY KEY (%s), or point \"keyColumn\" at an existing unique/PK column",
 				internal.QuoteTable(table), internal.QuoteIdent(d.config.KeyColumn)))
+	}
+
+	// Invariant 6 / design doc §5: source_key population depends on the
+	// column existing. Fail fast at Open (for static tables) rather than on
+	// every upsert/delete, mirroring the vector/key column checks above.
+	if d.config.SourceKeyColumn != "" {
+		exists, err := internal.ColumnExists(ctx, d.conn, table, d.config.SourceKeyColumn)
+		if err != nil {
+			return internal.NewCodedError(internal.CodeConnectionFailed, "failed to introspect the source_key column").
+				WithConfigPath("sourceKeyColumn").
+				Wrapping(err)
+		}
+		if !exists {
+			return internal.NewCodedError(internal.CodeSourceKeyColumnMissing,
+				fmt.Sprintf("source_key column %q does not exist on table %q", d.config.SourceKeyColumn, table)).
+				WithConfigPath("sourceKeyColumn").
+				WithSuggestion(fmt.Sprintf(
+					"add the column, e.g. ALTER TABLE %s ADD COLUMN %s text, and consider CREATE INDEX ON %s (%s) for delete performance; or set \"sourceKeyColumn\" to \"\" to disable source_key population (not recommended: reopens the orphan gap fixed by design doc §5)",
+					internal.QuoteTable(table), internal.QuoteIdent(d.config.SourceKeyColumn),
+					internal.QuoteTable(table), internal.QuoteIdent(d.config.SourceKeyColumn)))
+		}
 	}
 
 	sdk.Logger(ctx).Info().
@@ -268,7 +289,7 @@ func (d *Destination) Teardown(ctx context.Context) error {
 // vector+metadata pair in one statement is what makes redelivery converge to a
 // single, consistent row (Invariant 3; design doc §6).
 func (d *Destination) queueUpsert(batch *pgx.Batch, table string, rec opencdc.Record) error {
-	key, err := extractKey(rec)
+	key, err := d.resolveID(rec)
 	if err != nil {
 		return err
 	}
@@ -297,6 +318,8 @@ func (d *Destination) queueUpsert(batch *pgx.Batch, table string, rec opencdc.Re
 	// Per-record dimension guard (backstop to the startup check, and the only
 	// dimension check available for templated tables). Invariant 6: refuse a
 	// mismatched vector rather than let pgvector reject or silently coerce it.
+	// This runs before source_key resolution below so a bad vector is always
+	// reported as a dimension error, not masked by a missing-source_key one.
 	if len(vec) != d.config.Dimension {
 		return internal.NewCodedError(internal.CodeVectorDimensionMismatch,
 			fmt.Sprintf("record vector has dimension %d but the connector is configured for dimension %d", len(vec), d.config.Dimension)).
@@ -308,22 +331,35 @@ func (d *Destination) queueUpsert(batch *pgx.Batch, table string, rec opencdc.Re
 	// types — vector, jsonb) drive encoding. The vector type is registered on
 	// the connection in Open; jsonb is handled by pgx's built-in codec.
 	cols := []string{internal.QuoteIdent(d.config.KeyColumn), internal.QuoteIdent(d.config.VectorColumn)}
-	placeholders := []string{"$1", "$2"}
 	args := []any{key, internal.FormatVector(vec)}
-	var setClauses []string
-	setClauses = append(setClauses, fmt.Sprintf("%s = EXCLUDED.%s",
-		internal.QuoteIdent(d.config.VectorColumn), internal.QuoteIdent(d.config.VectorColumn)))
+	setClauses := []string{fmt.Sprintf("%s = EXCLUDED.%s",
+		internal.QuoteIdent(d.config.VectorColumn), internal.QuoteIdent(d.config.VectorColumn))}
 
 	if d.config.MetadataColumn != "" {
 		metaJSON, err := buildMetadata(rec)
 		if err != nil {
 			return err
 		}
-		cols = append(cols, internal.QuoteIdent(d.config.MetadataColumn))
-		placeholders = append(placeholders, "$3")
-		args = append(args, metaJSON)
-		setClauses = append(setClauses, fmt.Sprintf("%s = EXCLUDED.%s",
-			internal.QuoteIdent(d.config.MetadataColumn), internal.QuoteIdent(d.config.MetadataColumn)))
+		cols, args, setClauses = appendColumn(cols, args, setClauses, d.config.MetadataColumn, metaJSON)
+	}
+
+	// Design doc §5: every upsert writes the source_key column so a later
+	// delete can fan out to every chunk row derived from that source record,
+	// regardless of how the chunk count has changed since. Required (not
+	// best-effort) whenever the column is enabled — a silently-skipped
+	// source_key would leave this row unreachable by a future delete's
+	// fan-out match, reopening the exact orphan gap this closes.
+	if d.config.SourceKeyColumn != "" {
+		sourceKey, err := d.resolveSourceKey(rec)
+		if err != nil {
+			return err
+		}
+		cols, args, setClauses = appendColumn(cols, args, setClauses, d.config.SourceKeyColumn, sourceKey)
+	}
+
+	placeholders := make([]string, len(args))
+	for i := range args {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
 	}
 
 	query := fmt.Sprintf(
@@ -338,12 +374,44 @@ func (d *Destination) queueUpsert(batch *pgx.Batch, table string, rec opencdc.Re
 	return nil
 }
 
-// queueDelete removes the row for a tombstone's key. Slice 1 deletes by the
-// record's own key (chunk_id). Deleting all chunks derived from a source record
-// by a source_key metadata match (design doc §5's orphan-avoidance rule) is a
-// deliberate later slice.
+// appendColumn appends a column/value pair to the running upsert's column
+// list, argument list, and ON CONFLICT SET clauses. Extracted so queueUpsert's
+// optional columns (metadata, source_key) stay in lockstep with each other
+// without hand-counting placeholder positions.
+func appendColumn(cols []string, args []any, setClauses []string, column string, value any) ([]string, []any, []string) {
+	quoted := internal.QuoteIdent(column)
+	cols = append(cols, quoted)
+	args = append(args, value)
+	setClauses = append(setClauses, fmt.Sprintf("%s = EXCLUDED.%s", quoted, quoted))
+	return cols, args, setClauses
+}
+
+// queueDelete removes every row derived from a tombstone's source record.
+//
+// When source_key population is enabled (the default), the delete matches on
+// SourceKeyColumn rather than the record's own key: chunk count can vary per
+// source record across updates (a document that shrinks produces fewer
+// chunks), so "delete the chunk_id this record happens to carry" would leave
+// prior chunks — from a chunk count that has since changed — orphaned in the
+// table. Matching on source_key removes every chunk ever derived from that
+// source record in one statement (design doc §5).
+//
+// When source_key population is disabled (SourceKeyColumn == ""), this falls
+// back to a delete-by-id match — the slice-1 behavior, which is orphan-prone
+// and documented as such in the README.
 func (d *Destination) queueDelete(batch *pgx.Batch, table string, rec opencdc.Record) error {
-	key, err := extractKey(rec)
+	if d.config.SourceKeyColumn != "" {
+		sourceKey, err := d.resolveSourceKey(rec)
+		if err != nil {
+			return err
+		}
+		query := fmt.Sprintf("DELETE FROM %s WHERE %s = $1",
+			internal.QuoteTable(table), internal.QuoteIdent(d.config.SourceKeyColumn))
+		batch.Queue(query, sourceKey)
+		return nil
+	}
+
+	key, err := d.resolveID(rec)
 	if err != nil {
 		return err
 	}
@@ -351,6 +419,38 @@ func (d *Destination) queueDelete(batch *pgx.Batch, table string, rec opencdc.Re
 		internal.QuoteTable(table), internal.QuoteIdent(d.config.KeyColumn))
 	batch.Queue(query, key)
 	return nil
+}
+
+// resolveID returns the upsert/delete conflict key (the stable chunk_id).
+// The chunking processor's metadata contract (config.IDMetadataKey, default
+// "ai.chunk.id") is authoritative when present on the record; otherwise the
+// record's own Key is used (slice-1 behavior), so records written outside the
+// chunking pipeline still work unmodified.
+func (d *Destination) resolveID(rec opencdc.Record) (any, error) {
+	if d.config.IDMetadataKey != "" {
+		if v, ok := rec.Metadata[d.config.IDMetadataKey]; ok && v != "" {
+			return v, nil
+		}
+	}
+	return extractKey(rec)
+}
+
+// resolveSourceKey extracts the source record's key from metadata
+// (config.SourceKeyMetadataKey, set by the chunking processor as
+// ai.chunk.source_key and preserved by the embedding processor). It is
+// required whenever source_key population is enabled: without it, neither the
+// upsert can populate the delete-matching column nor can a delete resolve its
+// fan-out, so a missing value is a coded error — never a silent skip that
+// would reopen the orphan gap design doc §5 closes.
+func (d *Destination) resolveSourceKey(rec opencdc.Record) (string, error) {
+	v, ok := rec.Metadata[d.config.SourceKeyMetadataKey]
+	if !ok || v == "" {
+		return "", internal.NewCodedError(internal.CodeMissingSourceKey,
+			fmt.Sprintf("record has no %q metadata to derive the source_key delete-fan-out column", d.config.SourceKeyMetadataKey)).
+			WithConfigPath("sourceKeyMetadataKey").
+			WithSuggestion("ensure the upstream chunking processor tags records with source_key metadata, or set \"sourceKeyColumn\" to \"\" to disable source_key population and fall back to delete-by-id (not recommended: reopens the orphan gap fixed by design doc §5)")
+	}
+	return v, nil
 }
 
 // staticTable returns the configured table name and true when it is a static
@@ -454,4 +554,14 @@ func metadataColumnForHint(col string) string {
 		return "metadata"
 	}
 	return col
+}
+
+// sourceKeyColumnForHint returns the trailing ", <col> text" clause to append
+// to a CREATE TABLE hint when source_key population is enabled, or "" when
+// disabled so the hint doesn't suggest a column the connector won't write to.
+func sourceKeyColumnForHint(col string) string {
+	if col == "" {
+		return ""
+	}
+	return fmt.Sprintf(", %s text", col)
 }

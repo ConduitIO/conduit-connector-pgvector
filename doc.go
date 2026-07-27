@@ -21,15 +21,23 @@
 // table keyed by each record's stable chunk_id, so at-least-once redelivery
 // converges to a single row (Invariant 3). At pipeline start it validates the
 // configured embedding dimension against the target table's vector column and
-// fails fast with a coded, actionable error on mismatch (Invariant 6).
+// fails fast with a coded, actionable error on mismatch (Invariant 6). Every
+// upsert also writes a source_key column (from the chunking processor's
+// ai.chunk.source_key metadata), which deletes match on instead of the
+// chunk_id: a source-record delete removes every chunk row ever derived from
+// it, not just the chunk_ids the current chunk count happens to produce (see
+// design doc §5's orphan-avoidance rule).
 //
 // Invariants upheld here (see the core repo's data-integrity invariants):
 //
 //   - Invariant 3 (at-least-once, no silent drop): upsert is keyed on the
 //     stable chunk_id via ON CONFLICT DO UPDATE, and a batch executes as one
 //     transaction so a partial failure returns n=0 for engine retry/DLQ — never
-//     an early ack.
+//     an early ack. A record missing required source_key metadata (when
+//     source_key population is enabled) is the same kind of failure: a coded
+//     error, never a silent partial write or delete.
 //   - Invariant 6 (no silent schema/dimension mangling): dimension mismatches
 //     are coded startup errors, and per-record dimension mismatches are coded
-//     write errors — never a silent truncate/pad.
+//     write errors — never a silent truncate/pad. A delete never silently
+//     under-matches: it either resolves its full source_key fan-out or fails.
 package pgvector

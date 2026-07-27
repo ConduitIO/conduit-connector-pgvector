@@ -2,7 +2,7 @@ version: "1.0"
 specification:
   name: pgvector
   summary: Conduit destination connector for pgvector (Postgres vector store).
-  description: |
+  description: |-
     The pgvector destination connector is the flagship vector sink for Conduit's
     AI data pipeline (CDC -> chunk -> embed -> pgvector), keeping a RAG index
     fresh from Postgres.
@@ -37,6 +37,17 @@ specification:
         validations:
           - type: required
             value: ""
+      - name: idMetadataKey
+        description: |-
+          IDMetadataKey is the record metadata key carrying the deterministic
+          chunk id ({source_key}:{index}), set by the chunking processor
+          (default "ai.chunk.id") and preserved by the embedding processor. When
+          present on a record it takes precedence over Record.Key as the upsert
+          conflict target; when absent, Record.Key is used (slice-1 behavior),
+          so records written outside the chunking pipeline still work.
+        type: string
+        default: ai.chunk.id
+        validations: []
       - name: keyColumn
         description: |-
           KeyColumn is the primary-key column used as the ON CONFLICT target for
@@ -50,6 +61,28 @@ specification:
           Leave empty to disable metadata writes.
         type: string
         default: metadata
+        validations: []
+      - name: sourceKeyColumn
+        description: |-
+          SourceKeyColumn is the TEXT column that stores the source record's
+          stable key, populated on every upsert. Deletes match on this column
+          (not KeyColumn) so a source-record delete removes every chunk row ever
+          derived from it, even when the chunk count has changed since the last
+          embed (design doc §5's orphan-avoidance rule). Leave empty to disable
+          source_key population, falling back to a delete-by-KeyColumn match —
+          the slice-1 behavior, which can orphan rows and is not recommended for
+          the RAG pipeline.
+        type: string
+        default: source_key
+        validations: []
+      - name: sourceKeyMetadataKey
+        description: |-
+          SourceKeyMetadataKey is the record metadata key carrying the source
+          record's key. The chunking processor sets this (default
+          "ai.chunk.source_key") and the embedding processor preserves it.
+          Required on every record when SourceKeyColumn is enabled.
+        type: string
+        default: ai.chunk.source_key
         validations: []
       - name: table
         description: |-

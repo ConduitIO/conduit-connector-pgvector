@@ -127,6 +127,35 @@ func HasSingleColumnUniqueConstraint(ctx context.Context, q Querier, table, colu
 	return ok, nil
 }
 
+// ColumnExists reports whether the given column exists on the table
+// (regardless of type). Used for the source_key column pre-flight check at
+// Open: source_key population depends on the column existing, and failing
+// fast there (like the vector/key column checks) is cheaper and clearer than
+// failing on every write.
+func ColumnExists(ctx context.Context, q Querier, table, column string) (bool, error) {
+	schema, tbl := splitSchemaTable(table)
+
+	const query = `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_attribute a
+			JOIN pg_class c ON c.oid = a.attrelid
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1
+			  AND c.relname = $2
+			  AND a.attname = $3
+			  AND a.attnum > 0
+			  AND NOT a.attisdropped
+		)
+	`
+
+	var ok bool
+	if err := q.QueryRow(ctx, query, schema, tbl, column).Scan(&ok); err != nil {
+		return false, fmt.Errorf("failed checking column existence for %s.%s.%s: %w", schema, tbl, column, err)
+	}
+	return ok, nil
+}
+
 // splitSchemaTable splits a possibly schema-qualified table reference into its
 // schema and table parts, defaulting to the "public" schema. It intentionally
 // treats only the first dot as the separator; pgvector target tables are simple

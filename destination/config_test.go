@@ -34,13 +34,16 @@ func record() opencdc.Record {
 
 func validConfig() destination.Config {
 	return destination.Config{
-		URL:            "postgres://user:pass@127.0.0.1:5432/db?sslmode=disable",
-		Table:          "docs",
-		Dimension:      768,
-		VectorColumn:   "embedding",
-		KeyColumn:      "id",
-		VectorField:    "vector",
-		MetadataColumn: "metadata",
+		URL:                  "postgres://user:pass@127.0.0.1:5432/db?sslmode=disable",
+		Table:                "docs",
+		Dimension:            768,
+		VectorColumn:         "embedding",
+		KeyColumn:            "id",
+		VectorField:          "vector",
+		MetadataColumn:       "metadata",
+		SourceKeyColumn:      "source_key",
+		SourceKeyMetadataKey: "ai.chunk.source_key",
+		IDMetadataKey:        "ai.chunk.id",
 	}
 }
 
@@ -97,6 +100,42 @@ func TestConfig_Validate_EmptyKeyColumn(t *testing.T) {
 	err := c.Validate(context.Background())
 	is.True(err != nil)
 	is.Equal(codeOf(t, err), internal.CodeInvalidConfig)
+}
+
+func TestConfig_Validate_SourceKeyColumnSameAsKeyColumn(t *testing.T) {
+	is := is.New(t)
+	c := validConfig()
+	c.SourceKeyColumn = c.KeyColumn
+	err := c.Validate(context.Background())
+	is.True(err != nil)
+	is.Equal(codeOf(t, err), internal.CodeInvalidConfig)
+
+	var ce *internal.CodedError
+	is.True(errors.As(err, &ce))
+	is.Equal(ce.ConfigPath, "sourceKeyColumn")
+}
+
+func TestConfig_Validate_SourceKeyColumnEmpty_Allowed(t *testing.T) {
+	// Disabling source_key population (empty sourceKeyColumn) is a valid,
+	// documented opt-out — it must not fail validation even though it equals
+	// the empty KeyColumn check's "same value" shape trivially avoided here.
+	is := is.New(t)
+	c := validConfig()
+	c.SourceKeyColumn = ""
+	is.NoErr(c.Validate(context.Background()))
+}
+
+func TestConfig_Validate_SourceKeyMetadataKeyEmptyWhileEnabled(t *testing.T) {
+	is := is.New(t)
+	c := validConfig()
+	c.SourceKeyMetadataKey = ""
+	err := c.Validate(context.Background())
+	is.True(err != nil)
+	is.Equal(codeOf(t, err), internal.CodeInvalidConfig)
+
+	var ce *internal.CodedError
+	is.True(errors.As(err, &ce))
+	is.Equal(ce.ConfigPath, "sourceKeyMetadataKey")
 }
 
 func TestConfig_TableFunction_Static(t *testing.T) {

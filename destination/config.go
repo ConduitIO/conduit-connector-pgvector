@@ -61,6 +61,27 @@ type Config struct {
 	// MetadataColumn is the JSONB column that receives the record's metadata.
 	// Leave empty to disable metadata writes.
 	MetadataColumn string `json:"metadataColumn" default:"metadata"`
+	// SourceKeyColumn is the TEXT column that stores the source record's
+	// stable key, populated on every upsert. Deletes match on this column
+	// (not KeyColumn) so a source-record delete removes every chunk row ever
+	// derived from it, even when the chunk count has changed since the last
+	// embed (design doc §5's orphan-avoidance rule). Leave empty to disable
+	// source_key population, falling back to a delete-by-KeyColumn match —
+	// the slice-1 behavior, which can orphan rows and is not recommended for
+	// the RAG pipeline.
+	SourceKeyColumn string `json:"sourceKeyColumn" default:"source_key"`
+	// SourceKeyMetadataKey is the record metadata key carrying the source
+	// record's key. The chunking processor sets this (default
+	// "ai.chunk.source_key") and the embedding processor preserves it.
+	// Required on every record when SourceKeyColumn is enabled.
+	SourceKeyMetadataKey string `json:"sourceKeyMetadataKey" default:"ai.chunk.source_key"`
+	// IDMetadataKey is the record metadata key carrying the deterministic
+	// chunk id ({source_key}:{index}), set by the chunking processor
+	// (default "ai.chunk.id") and preserved by the embedding processor. When
+	// present on a record it takes precedence over Record.Key as the upsert
+	// conflict target; when absent, Record.Key is used (slice-1 behavior),
+	// so records written outside the chunking pipeline still work.
+	IDMetadataKey string `json:"idMetadataKey" default:"ai.chunk.id"`
 }
 
 // Validate performs config-time sanity checks and returns machine-actionable,
@@ -96,6 +117,20 @@ func (c *Config) Validate(ctx context.Context) error {
 		return internal.NewCodedError(internal.CodeInvalidConfig, "vector field name must not be empty").
 			WithConfigPath("vectorField").
 			WithSuggestion("set \"vectorField\" to the record payload field that carries the embedding vector")
+	}
+
+	if strings.TrimSpace(c.SourceKeyColumn) != "" && c.SourceKeyColumn == c.KeyColumn {
+		return internal.NewCodedError(internal.CodeInvalidConfig,
+			"\"sourceKeyColumn\" must not be the same column as \"keyColumn\"").
+			WithConfigPath("sourceKeyColumn").
+			WithSuggestion("point \"sourceKeyColumn\" at a dedicated column (default \"source_key\"), distinct from the upsert conflict key")
+	}
+
+	if strings.TrimSpace(c.SourceKeyColumn) != "" && strings.TrimSpace(c.SourceKeyMetadataKey) == "" {
+		return internal.NewCodedError(internal.CodeInvalidConfig,
+			"\"sourceKeyMetadataKey\" must not be empty while \"sourceKeyColumn\" is set").
+			WithConfigPath("sourceKeyMetadataKey").
+			WithSuggestion("set \"sourceKeyMetadataKey\" to the metadata key carrying the source record's key (default \"ai.chunk.source_key\"), or clear \"sourceKeyColumn\" to disable source_key population")
 	}
 
 	if _, err := c.TableFunction(); err != nil {
