@@ -24,8 +24,7 @@ converges to a single row rather than duplicating it.
 At pipeline start the connector validates the configured embedding
 `dimension` against the target table's `vector` column and fails fast with a
 stable, actionable error (`ai.vector_dimension_mismatch`) if they disagree,
-instead of failing silently on the first write.
-<!-- /readmegen:description -->
+instead of failing silently on the first write.<!-- /readmegen:description -->
 
 ## Destination
 
@@ -35,48 +34,112 @@ The destination connector writes embedding records into a pgvector table.
 
 | Record part | Target |
 | --- | --- |
-| `Record.Key` (the stable `chunk_id`) | the `keyColumn` (upsert conflict target) |
+| `Record.Metadata[idMetadataKey]` (default `ai.chunk.id`), falling back to `Record.Key` if absent | the `keyColumn` (upsert conflict target) |
 | `Record.Payload.After[vectorField]` (a numeric array) | the `vectorColumn` (a `vector(N)` column) |
 | `Record.Metadata` | the `metadataColumn` (`jsonb`), if configured |
+| `Record.Metadata[sourceKeyMetadataKey]` (default `ai.chunk.source_key`) | the `sourceKeyColumn` (`text`, default `source_key`), if configured — the delete-fan-out match key |
+
+The chunking processor tags every chunk record with this metadata contract
+(`ai.chunk.id`, `ai.chunk.source_key`, plus offset/index/length fields not used
+by this connector), and the embedding processor preserves it. Both metadata
+keys are configurable so records written outside the canonical chunking
+pipeline can still supply equivalent values under different keys.
 
 ### Upsert semantics (idempotent under retry)
 
 Every create/update/snapshot record is written with:
 
 ```sql
-INSERT INTO <table> (<keyColumn>, <vectorColumn>, <metadataColumn>)
-VALUES ($1, $2, $3)
+INSERT INTO <table> (<keyColumn>, <vectorColumn>, <metadataColumn>, <sourceKeyColumn>)
+VALUES ($1, $2, $3, $4)
 ON CONFLICT (<keyColumn>) DO UPDATE
   SET <vectorColumn> = EXCLUDED.<vectorColumn>,
-      <metadataColumn> = EXCLUDED.<metadataColumn>
+      <metadataColumn> = EXCLUDED.<metadataColumn>,
+      <sourceKeyColumn> = EXCLUDED.<sourceKeyColumn>
 ```
+
+(`metadataColumn` and `sourceKeyColumn` are each omitted from the statement
+when their config value is empty.)
 
 The connector registers pgvector's `vector` type on the connection at startup,
 so the embedding binds by the column's real type (reported by the prepared
 statement) rather than a SQL cast.
 
 Because the conflict key is the record's stable `chunk_id` and the whole
-vector+metadata pair is replaced in a single statement, redelivering the same
-record (at-least-once) converges to exactly one row — no duplicates, no
-half-written rows. A batch of records is executed as a single transaction: if
-any statement fails, none are committed and the connector reports `0` records
-written so the engine can retry or route to the DLQ. **No record is acked
-before it is durably written** (data-integrity invariants 1 and 3).
+row is replaced in a single statement, redelivering the same record
+(at-least-once) converges to exactly one row — no duplicates, no half-written
+rows. A batch of records is executed as a single transaction: if any statement
+fails, none are committed and the connector reports `0` records written so the
+engine can retry or route to the DLQ. **No record is acked before it is
+durably written** (data-integrity invariants 1 and 3).
 
-### Deletes and the orphan caveat (read this before running RAG)
+Every upsert also writes `sourceKeyColumn` (when enabled) from the record's
+`sourceKeyMetadataKey` metadata. This is what makes the delete below able to
+find every chunk derived from a source record without knowing their ids.
 
-Delete records remove the row whose `keyColumn` equals the record key
-(`chunk_id`). This is a **by-chunk-id delete only**. It does **not** yet remove
-all chunks derived from a source record by a `source_key` match.
+### Deletes: fan-out by source_key, not chunk_id
 
-Concretely: if a source record is updated and re-chunked into **fewer** chunks
-than before (e.g. a document shrinks from 5 chunks to 3), the embeddings for the
-now-removed chunks (`…:3`, `…:4`) are **not** deleted and remain in the table —
-they stay retrievable by similarity search as stale/orphaned vectors. Deleting
-all chunks for a source record via a `source_key` metadata match (design doc
-§5's orphan-avoidance rule) is a planned later slice. Until then, operators must
-account for this (e.g. re-embed into a fresh table, or delete by `chunk_id`
-explicitly).
+A delete (tombstone) record is resolved with:
+
+```sql
+DELETE FROM <table> WHERE <sourceKeyColumn> = $1
+```
+
+using the value from the delete record's `sourceKeyMetadataKey` metadata —
+**not** a `keyColumn = <chunk_id>` match. This is the load-bearing correctness
+fix design doc §5 requires: chunk count varies per source record across
+updates (a document that shrinks on re-chunking produces fewer chunks than it
+had before), so the destination cannot assume a stable 1:1 chunk-to-source
+mapping at delete time. Deleting "the chunk_id this tombstone happens to
+carry" would silently leave prior chunks — from a chunk count that has since
+changed — orphaned in the table, retrievable by similarity search as stale
+vectors. Matching on `source_key` instead removes **every** row ever upserted
+for that source record in one statement, regardless of how many chunk ids it
+has carried over time.
+
+This requires every create/update/snapshot **and** every delete record to
+carry `sourceKeyMetadataKey` metadata; a record missing it is a coded error
+(`pgvector.missing_source_key`), not a silent partial write or delete — an
+upsert that silently skipped writing `source_key` would make that row
+unreachable by a future delete's fan-out, and a delete that silently fell back
+to some other match would risk under- or over-deleting. Invariant 3 (no early
+ack on failure) holds here too: a missing-source_key error fails the whole
+batch, so nothing is acked.
+
+**Opting out.** Set `sourceKeyColumn` to `""` to disable source_key population
+entirely. Deletes then fall back to a `keyColumn = <chunk_id>` match — the
+slice-1 behavior, which reopens the orphan gap above and is **not
+recommended** for the RAG pipeline. This exists for destinations used outside
+the canonical chunking pipeline, where no `source_key` concept applies (e.g. a
+1:1 record-to-row mapping with no chunking upstream).
+
+> **Known limitation — the opt-out above is not reachable from real pipeline
+> config today.** `conduit-connector-sdk`'s config layer
+> (`config.Config.ApplyDefaults`) reapplies a parameter's default whenever the
+> submitted value trims to empty — it cannot distinguish "the operator set
+> this to `\"\"`" from "the operator didn't set this at all". So
+> `sourceKeyColumn: ""` in a real pipeline's YAML/settings silently resolves
+> back to `"source_key"` instead of disabling the feature. **The exact same
+> pre-existing gap already affects `metadataColumn: ""`** (slice 1's own
+> documented "leave empty to disable metadata writes" opt-out, which has never
+> actually been reachable through pipeline config either — it went unnoticed
+> because nothing exercised it end-to-end until this slice's acceptance/
+> integration suite did). The connector's own handling of a genuinely empty
+> `SourceKeyColumn`/`MetadataColumn` is correct and covered by tests that
+> construct `destination.Config` directly; reaching that state from pipeline
+> config requires either an SDK-level fix (a way to represent "explicitly
+> unset" distinct from "explicitly empty") or a sentinel-value convention on
+> this connector's side. Tracked as a follow-up, not fixed in this slice.
+
+**Column shape.** `source_key` is a **dedicated `text` column**, not a field
+nested inside the JSONB `metadataColumn`. A dedicated column lets
+`DELETE ... WHERE source_key = $1` use a plain index (recommended:
+`CREATE INDEX ON <table> (source_key)`); matching inside JSONB would need a
+functional or GIN index on an extracted expression for the same performance
+and is a worse default. The design doc's §5 metadata-mapping paragraph
+describes record metadata in general mapping to the JSONB column; this
+connector treats `source_key` as a first-class, indexable exception to that
+because it is a delete-matching key, not passthrough metadata.
 
 ### Dimension validation at pipeline start (fail fast)
 
@@ -122,6 +185,8 @@ config path where known, and a suggested fix.
 | `pgvector.missing_vector_field` | A record carries no valid embedding vector in `vectorField`. |
 | `pgvector.missing_key` | A record has no usable key to derive the upsert conflict target. |
 | `pgvector.write_failed` | The batch upsert/delete failed to execute. |
+| `pgvector.source_key_column_missing` | `sourceKeyColumn` is enabled but the configured column does not exist on the target table. |
+| `pgvector.missing_source_key` | `sourceKeyColumn` is enabled but a record carries no value for `sourceKeyMetadataKey`. |
 
 ### Example pipeline
 
@@ -130,10 +195,12 @@ The target table must exist and the `pgvector` extension must be installed
 
 ```sql
 CREATE TABLE docs (
-  id        text PRIMARY KEY,
-  embedding vector(768),
-  metadata  jsonb
+  id          text PRIMARY KEY,
+  embedding   vector(768),
+  metadata    jsonb,
+  source_key  text
 );
+CREATE INDEX ON docs (source_key);
 ```
 
 ```yaml
@@ -154,6 +221,9 @@ pipelines:
           keyColumn: id
           vectorField: vector
           metadataColumn: metadata
+          sourceKeyColumn: source_key
+          sourceKeyMetadataKey: ai.chunk.source_key
+          idMetadataKey: ai.chunk.id
 ```
 
 <!-- readmegen:destination.parameters.yaml -->
@@ -165,6 +235,7 @@ pipelines:
     connectors:
       - id: example
         plugin: "pgvector"
+        type: destination
         settings:
           # Dimension is the embedding dimension the upstream model produces. It
           # is validated against the target table's vector column at pipeline
@@ -177,6 +248,16 @@ pipelines:
           # Type: string
           # Required: yes
           url: ""
+          # IDMetadataKey is the record metadata key carrying the deterministic
+          # chunk id ({source_key}:{index}), set by the chunking processor
+          # (default "ai.chunk.id") and preserved by the embedding processor.
+          # When present on a record it takes precedence over Record.Key as the
+          # upsert conflict target; when absent, Record.Key is used (slice-1
+          # behavior), so records written outside the chunking pipeline still
+          # work.
+          # Type: string
+          # Required: no
+          idMetadataKey: "ai.chunk.id"
           # KeyColumn is the primary-key column used as the ON CONFLICT target
           # for idempotent upserts. It holds the record's stable chunk_id.
           # Type: string
@@ -187,6 +268,24 @@ pipelines:
           # Type: string
           # Required: no
           metadataColumn: "metadata"
+          # SourceKeyColumn is the TEXT column that stores the source record's
+          # stable key, populated on every upsert. Deletes match on this column
+          # (not KeyColumn) so a source-record delete removes every chunk row
+          # ever derived from it, even when the chunk count has changed since
+          # the last embed (design doc §5's orphan-avoidance rule). Leave empty
+          # to disable source_key population, falling back to a
+          # delete-by-KeyColumn match — the slice-1 behavior, which can orphan
+          # rows and is not recommended for the RAG pipeline.
+          # Type: string
+          # Required: no
+          sourceKeyColumn: "source_key"
+          # SourceKeyMetadataKey is the record metadata key carrying the source
+          # record's key. The chunking processor sets this (default
+          # "ai.chunk.source_key") and the embedding processor preserves it.
+          # Required on every record when SourceKeyColumn is enabled.
+          # Type: string
+          # Required: no
+          sourceKeyMetadataKey: "ai.chunk.source_key"
           # Table is the target table into which embedding rows are upserted.
           # Supports a Go template evaluated per record (default: the record's
           # OpenCDC collection), matching the Postgres connector's convention.
@@ -255,32 +354,62 @@ running; it brings up a `pgvector/pgvector` Postgres via
 `test/docker-compose.yml`. Run `make test-unit` for the unit-only suite (no
 Docker required).
 
-Integration tests (dimension validation, upsert idempotency, delete,
-batch atomic-rollback, per-record dimension guard) are Docker-gated: they skip
-automatically when the test database is unreachable, so they execute in CI (and
-locally with `make test`) but are skipped in a Docker-less environment.
+Integration tests (dimension validation, upsert idempotency, delete-by-id,
+delete-by-source_key fan-out, batch atomic-rollback, per-record dimension
+guard, source_key requiredness) are Docker-gated: they skip automatically when
+the test database is unreachable, so they execute in CI (and locally with
+`make test`) but are skipped in a Docker-less environment.
 
-### Acceptance suite (not yet wired — deferred to slice 2)
+### Acceptance suite
 
-The SDK's `sdk.AcceptanceTest` compatibility suite is **not** wired up yet. That
-harness is round-trip: it writes with the destination and reads back with a
-source, and it calls `t.Fatal` when `NewSource == nil`. This connector is
-destination-only, so the suite cannot run as-is. Wiring it — via a test-only
-pgvector source or a destination-subset driver — is a planned later slice.
+The SDK's `sdk.AcceptanceTest` compatibility suite is wired in
+`destination_acceptance_test.go`, via a custom driver (embedding
+`sdk.ConfigurableAcceptanceTestDriver`) rather than the default one, because
+the default driver's round-trip model doesn't fit this connector:
+
+- **`ReadFromDestination` is overridden.** The SDK default opens a `Source`
+  and reads back through it; this connector is destination-only
+  (`Connector.NewSource == nil`), so the override queries the pgvector table
+  directly (`SELECT ... embedding::text ... WHERE id = $1`) to verify what
+  landed. This is the only way to verify writes for a write-only sink.
+- **`GenerateRecord` is overridden.** The SDK default generates records with
+  arbitrary mixed-type payloads (bools, nested maps, strings). This
+  connector's `Write` requires a structured payload with a fixed-dimension
+  numeric `vectorField` and carries the `sourceKeyMetadataKey` metadata
+  contract — generic fuzzed payloads can't satisfy that domain shape, so the
+  override always generates a valid vector of the configured dimension plus
+  `ai.chunk.source_key` metadata.
+
+**Covered** (run automatically as part of `TestAcceptance` in `make test`):
+`TestSpecifier_Exists`, `TestSpecifier_Specify_Success`,
+`TestDestination_Parameters_Success`, `TestDestination_Configure_Success`,
+`TestDestination_Configure_RequiredParams`, `TestDestination_Write_Success`.
+
+**Skipped, with reason** (the harness's own `skipIfNoSource` guard, not a
+workaround added here): every `TestSource_*` test. This connector has no
+Source (`NewSource == nil`) — it is a write-only vector sink by design, per
+the design doc's §5 shape (`conduit-connector-sdk` standard Destination
+pattern, no new transport). There is nothing to skip-with-reason beyond that:
+the harness detects the missing Source itself and skips cleanly rather than
+failing, so no coverage is silently faked.
 
 ## Delivery semantics
 
 At-least-once. Duplicate delivery is safe: upserts are idempotent by
 `chunk_id`, and a batch is written in a single implicit transaction, so a
 partial failure rolls back the whole batch and nothing is acked. Deletes for a
-non-existent key are a no-op.
+non-existent `source_key` (or `chunk_id`, in the opted-out legacy mode) are a
+no-op — zero rows matched is not an error.
 
 **Table preconditions:** the target table must exist, the `pgvector` extension
 must be installed, `vectorColumn` must be a `vector(N)` column whose `N` equals
-the configured `dimension`, and `keyColumn` must have a single-column unique or
-primary-key constraint. For a static `table` these are all checked at pipeline
-start and fail fast with a coded error; for a templated `table` they are
-enforced per record at write time.
+the configured `dimension`, `keyColumn` must have a single-column unique or
+primary-key constraint, and (when `sourceKeyColumn` is enabled, the default)
+`sourceKeyColumn` must exist as a column on the table. For a static `table`
+these are all checked at pipeline start and fail fast with a coded error; for
+a templated `table` they are enforced per record at write time.
 
-**Orphaned embeddings:** deletes are by `chunk_id` only — see the orphan caveat
-under [Deletes](#deletes-and-the-orphan-caveat-read-this-before-running-rag).
+**Orphaned embeddings:** closed by default — deletes fan out by `source_key`,
+removing every chunk ever derived from a source record regardless of chunk-id
+churn. See [Deletes](#deletes-fan-out-by-source_key-not-chunk_id). The orphan
+risk only returns if an operator explicitly sets `sourceKeyColumn: ""`.

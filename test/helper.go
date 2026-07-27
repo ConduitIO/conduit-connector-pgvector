@@ -63,12 +63,16 @@ func EnsureExtension(ctx context.Context, t *testing.T, conn *pgx.Conn) {
 
 // SetupVectorTable creates a fresh vector table with the given dimension and
 // drops it on cleanup. The table has an id text primary key, an embedding
-// vector(dim) column, and a metadata jsonb column.
+// vector(dim) column, a metadata jsonb column, and a source_key text column
+// (indexed) — the shape the connector's default config (sourceKeyColumn
+// enabled) expects, matching the README's recommended schema.
 func SetupVectorTable(ctx context.Context, t *testing.T, conn *pgx.Conn, table string, dim int) {
 	t.Helper()
 	is := is.New(t)
 	_, err := conn.Exec(ctx, fmt.Sprintf(
-		`CREATE TABLE %q (id text PRIMARY KEY, embedding vector(%d), metadata jsonb)`, table, dim))
+		`CREATE TABLE %q (id text PRIMARY KEY, embedding vector(%d), metadata jsonb, source_key text)`, table, dim))
+	is.NoErr(err)
+	_, err = conn.Exec(ctx, fmt.Sprintf(`CREATE INDEX ON %q (source_key)`, table))
 	is.NoErr(err)
 	t.Cleanup(func() {
 		_, _ = conn.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %q`, table))

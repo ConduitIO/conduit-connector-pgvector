@@ -77,6 +77,21 @@ const (
 	// CodeWriteFailed is raised when the batch upsert/delete against pgvector
 	// fails to execute.
 	CodeWriteFailed = "pgvector.write_failed"
+
+	// CodeSourceKeyColumnMissing is raised when source_key population is
+	// enabled (config "sourceKeyColumn" is non-empty) but the configured
+	// column does not exist on the target table. Raised at Open for static
+	// tables, mirroring the vector/key column fail-fast checks (design doc
+	// §5's orphan-avoidance rule depends on this column existing).
+	CodeSourceKeyColumnMissing = "pgvector.source_key_column_missing"
+
+	// CodeMissingSourceKey is raised when source_key population is enabled
+	// but a record carries no value for the configured source_key metadata
+	// key. Required on every create/update/snapshot (to populate the
+	// delete-matching column) and every delete (to resolve the fan-out) —
+	// silently skipping it would reopen the orphan gap design doc §5 closes,
+	// so it is a coded error rather than a silent partial write/delete.
+	CodeMissingSourceKey = "pgvector.missing_source_key"
 )
 
 // CodedError is a machine-actionable connector error. It carries a stable code,

@@ -115,6 +115,28 @@ func (q *fakeBoolQuerier) QueryRow(_ context.Context, _ string, args ...any) pgx
 	return q.row
 }
 
+func TestColumnExists(t *testing.T) {
+	is := is.New(t)
+
+	q := &fakeBoolQuerier{row: fakeBoolRow{val: true}}
+	ok, err := internal.ColumnExists(context.Background(), q, "rag.chunks", "source_key")
+	is.NoErr(err)
+	is.True(ok)
+	is.Equal(q.lastArgs, []any{"rag", "chunks", "source_key"})
+
+	q = &fakeBoolQuerier{row: fakeBoolRow{val: false}}
+	ok, err = internal.ColumnExists(context.Background(), q, "docs", "source_key")
+	is.NoErr(err)
+	is.True(!ok)
+}
+
+func TestColumnExists_QueryError(t *testing.T) {
+	is := is.New(t)
+	q := &fakeBoolQuerier{row: fakeBoolRow{err: errors.New("connection reset")}}
+	_, err := internal.ColumnExists(context.Background(), q, "docs", "source_key")
+	is.True(err != nil)
+}
+
 func TestHasSingleColumnUniqueConstraint(t *testing.T) {
 	is := is.New(t)
 

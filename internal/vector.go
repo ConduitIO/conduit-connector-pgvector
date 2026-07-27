@@ -73,6 +73,31 @@ func toFloat32(e any) (float32, error) {
 	}
 }
 
+// ParseVectorText parses pgvector's text output format (e.g. "[0.1,0.2,0.3]",
+// as returned by casting a vector column to ::text) back into a []float32.
+// It is FormatVector's inverse, used by tests that read a written row back
+// from Postgres to verify upsert/round-trip correctness.
+func ParseVectorText(s string) ([]float32, error) {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '[' || s[len(s)-1] != ']' {
+		return nil, fmt.Errorf("invalid pgvector text literal %q: expected \"[...]\"", s)
+	}
+	inner := s[1 : len(s)-1]
+	if inner == "" {
+		return []float32{}, nil
+	}
+	parts := strings.Split(inner, ",")
+	out := make([]float32, len(parts))
+	for i, p := range parts {
+		f, err := strconv.ParseFloat(strings.TrimSpace(p), 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid vector element %d (%q): %w", i, p, err)
+		}
+		out[i] = float32(f)
+	}
+	return out, nil
+}
+
 // FormatVector renders a []float32 as a pgvector text literal, e.g.
 // "[0.1,0.2,0.3]". This is the wire form pgvector's input function accepts; the
 // connector binds it as a text parameter and casts to `vector` in SQL, avoiding
