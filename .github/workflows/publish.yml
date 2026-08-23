@@ -49,13 +49,27 @@ jobs:
 
       - name: Build + cosign-sign the artifact matrix
         id: publish
-        uses: ConduitIO/connector-publish-action@v1
+        # Pinned to an exact tag, not the moving @v1 alias: this action
+        # signs the artifacts and opens the registry PR, so whoever moves
+        # @v1 would control both. Not hypothetical - the artifact shape
+        # already changed under that alias (bare binary -> .tar.gz), which
+        # is why the live index's postgres entry has extensionless URLs.
+        uses: ConduitIO/connector-publish-action@v1.0.7
         with:
           mode: build
           connector-name: pgvector
           version: ${{ github.ref_name }}
+          # -ldflags is not optional here, and its absence is invisible in
+          # any green check. .goreleaser.yml stamps the same symbol for the
+          # release archives; without it the artifact the REGISTRY serves -
+          # the signed, provenanced, immutable one - reports
+          # `spec.version = (devel)` to the engine while the archives on the
+          # same release report v0.1.0. Two binaries, one tag, disagreeing
+          # about what they are, with the wrong one being the one users get.
           build-command: |
-            CGO_ENABLED=0 go build -o "$OUTPUT_PATH" ./cmd/connector
+            CGO_ENABLED=0 go build \
+              -ldflags "-s -w -X 'github.com/conduitio/conduit-connector-pgvector.version=${{ github.ref_name }}'" \
+              -o "$OUTPUT_PATH" ./cmd/connector
 
       - name: Format subjects for the SLSA generator
         id: hash
@@ -91,7 +105,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Open/update the index-repo PR
-        uses: ConduitIO/connector-publish-action@v1
+        uses: ConduitIO/connector-publish-action@v1.0.7
         with:
           mode: publish
           connector-name: pgvector
