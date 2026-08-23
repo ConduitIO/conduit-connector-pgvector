@@ -41,11 +41,34 @@ runs `release.yml` end to end and leaves the registry untouched.
 Cosign keyless signing against this repo's OIDC identity, and the register job's PR against the
 index repo. Both run for real the first time.
 
-Note the register job pushes a branch to `ConduitIO/conduit-connector-registry`, which needs
-`contents: write` on `REGISTRY_INDEX_PR_TOKEN` there — broader than the action's own docs
-describe. If that token was minted to the narrower documented scope, the run fails at the **last**
-step, after the artifact is already signed, released and provenanced. Confirm the scope before the
-first tag.
+The register job pushes a branch to `ConduitIO/conduit-connector-registry`, which needs
+`contents: write` on `REGISTRY_INDEX_PR_TOKEN` there — broader than the action's own docs describe.
+**That scope is confirmed by evidence rather than by reading the secret:** the same org secret has
+already pushed branches and opened PRs to that repo four times — registry PRs #13 `generator`,
+#14 `postgres`, #15 `log`, #16 `kafka`, each on a `connector-publish-action/<name>-<sha>` branch
+created by the workflow, all merged.
+
+And unlike the tag-deletion trap, a failure here is **recoverable**: the release, signatures and
+provenance are already correct and immutable, so the register step can be re-run, or the index PR
+opened by hand from the artifacts it produced. Nothing has to be re-signed.
+
+## `minConduitVersion` / `minProtocolVersion` are a one-way door
+
+`publish.yml` declares `0.15.0` / `0.9.0`, matching every connector already in the index. These
+land in the first registry entry and cannot be changed without a re-registration PR, so the choice
+is deliberate rather than inherited:
+
+**They describe what THIS CONNECTOR needs, not what the RAG template needs.** pgvector is an
+ordinary destination connector; it works against a 0.15.0 engine. The `postgres-pgvector-rag`
+template additionally needs architecture v2 and the `ai.chunk`/`ai.embed` processors (which declare
+`minConduitVersion: 0.20.0`), but those are the *template's* prerequisites and the template surfaces
+them itself — `conduit pipelines init` prints them, and a drift guard in `template_gallery_test.go`
+keeps that prose honest.
+
+Raising this floor to 0.20.0 to match the template would wrongly refuse installation to anyone
+using pgvector outside the RAG pipeline, which is a legitimate and probably common case. The
+alternative failure — someone installs pgvector on a 0.15.0 engine and then discovers the template
+needs more — is caught at `pipelines init` time with an actionable message, not silently.
 
 ## First registration pins the publisher identity permanently
 
