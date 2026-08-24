@@ -16,7 +16,7 @@ specification:
     `dimension` against the target table's `vector` column and fails fast with a
     stable, actionable error (`ai.vector_dimension_mismatch`) if they disagree,
     instead of failing silently on the first write.
-  version: (devel)
+  version: v0.1.0
   author: Meroxa, Inc.
   destination:
     parameters:
