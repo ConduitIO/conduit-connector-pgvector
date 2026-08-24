@@ -8,7 +8,7 @@ require (
 	github.com/conduitio/conduit-connector-sdk v0.14.1
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/matryer/is v1.4.1
-	github.com/rs/zerolog v1.34.0
+	github.com/rs/zerolog v1.35.1
 )
 
 require (
