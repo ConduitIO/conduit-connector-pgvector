@@ -44,6 +44,6 @@ jobs:
       # its golangci-lint v1 dependency, at which point tools/go.mod can hold
       # the version again and this can go back to reading it.
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
