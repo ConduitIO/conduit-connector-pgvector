@@ -33,7 +33,15 @@ func record() opencdc.Record {
 }
 
 func validConfig() destination.Config {
-	return destination.Config{
+	// The URL below is a syntactically valid DSN that is never dialed - these
+	// tests only exercise config parsing and validation. gosec attributes
+	// G101 to the composite literal rather than to the string, which is why
+	// the directive sits here and not on the field.
+	//
+	// Annotated rather than excluded in .golangci.yml so the exemption stays
+	// attached to the one literal that needs it: a real credential appearing
+	// elsewhere in this file still gets flagged.
+	return destination.Config{ //nolint:gosec // G101: fake DSN, parsing-only test
 		URL:                  "postgres://user:pass@127.0.0.1:5432/db?sslmode=disable",
 		Table:                "docs",
 		Dimension:            768,

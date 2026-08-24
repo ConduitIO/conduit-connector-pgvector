@@ -14,16 +14,36 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
-      # This step sets up the variable steps.golangci-lint-version.outputs.v
-      # to contain the version of golangci-lint (e.g. v1.54.2).
-      # The version is taken from go.mod.
-      - name: Golangci-lint version
-        id: golangci-lint-version
-        run: |
-          GOLANGCI_LINT_VERSION=$( go list -modfile=tools/go.mod -m -f '{{.Version}}' github.com/golangci/golangci-lint/v2 )
-          echo "v=$GOLANGCI_LINT_VERSION" >> "$GITHUB_OUTPUT"
-
+      # Pinned here rather than read from tools/go.mod, which is what this
+      # step used to do. The reason is a genuine dependency conflict, not
+      # convenience:
+      #
+      # go.mod now declares `go 1.25.0`, forced by google.golang.org/grpc
+      # v1.82.1 (needed to clear GO-2026-6061). golangci-lint refuses to run
+      # when the binary's own Go version is older than the module's target,
+      # so the tools/go.mod pin of v2.1.6 - whose released binary is built
+      # with go1.24 - now fails with:
+      #
+      #   can't load config: the Go language version (go1.24) used to build
+      #   golangci-lint is lower than the targeted Go version (1.25.0)
+      #
+      # Bumping tools/go.mod is the obvious fix and it does not work here.
+      # conduit-connector-sdk/conn-sdk-cli depends on golangci-lint **v1**,
+      # whose ginkgolinter shim imports a package that only exists in
+      # ginkgolinter v0.24.0+, which requires go >= 1.26.0. So the tools
+      # module cannot hold golangci-lint v2.12.2 and conn-sdk-cli at the same
+      # time. (ConduitIO/conduit has no conn-sdk-cli, which is why its own
+      # tools/go.mod carries v2.12.2 without trouble.)
+      #
+      # Bumping conduit-connector-sdk to escape that is not on the table for a
+      # linter: the SDK pin is a compatibility contract that also determines
+      # this connector's registry minConduitVersion/minProtocolVersion.
+      #
+      # So the linter binary is decoupled from the tools module. v2.12.2
+      # matches what ConduitIO/conduit runs. Revisit once conn-sdk-cli drops
+      # its golangci-lint v1 dependency, at which point tools/go.mod can hold
+      # the version again and this can go back to reading it.
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
-          version: ${{ steps.golangci-lint-version.outputs.v }}
+          version: v2.12.2
