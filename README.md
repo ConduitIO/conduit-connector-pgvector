@@ -235,6 +235,7 @@ pipelines:
     connectors:
       - id: example
         plugin: "pgvector"
+        type: destination
         settings:
           # Dimension is the embedding dimension the upstream model produces. It
           # is validated against the target table's vector column at pipeline
