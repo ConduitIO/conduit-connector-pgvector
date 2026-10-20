@@ -4,7 +4,7 @@ go 1.26.9
 
 require (
 	github.com/Masterminds/sprig/v3 v3.3.0
-	github.com/conduitio/conduit-commons v0.8.0
+	github.com/conduitio/conduit-commons v0.9.1
 	github.com/conduitio/conduit-connector-sdk v0.15.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/matryer/is v1.4.1
@@ -48,6 +48,7 @@ require (
 	github.com/samber/slog-zerolog/v2 v2.9.2 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/spf13/cast v1.7.0 // indirect
+	github.com/twmb/franz-go/pkg/sr v1.8.0 // indirect
 	github.com/twmb/go-cache v1.4.0 // indirect
 	go.uber.org/goleak v1.3.0 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
