@@ -67,7 +67,7 @@ jobs:
           # same release report v0.1.0. Two binaries, one tag, disagreeing
           # about what they are, with the wrong one being the one users get.
           build-command: |
-            CGO_ENABLED=0 go build \
+            CGO_ENABLED=0 go build -trimpath \
               -ldflags "-s -w -X 'github.com/conduitio/conduit-connector-pgvector.version=${{ github.ref_name }}'" \
               -o "$OUTPUT_PATH" ./cmd/connector
 
