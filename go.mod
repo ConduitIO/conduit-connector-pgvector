@@ -6,7 +6,7 @@ require (
 	github.com/Masterminds/sprig/v3 v3.3.0
 	github.com/conduitio/conduit-commons v0.8.0
 	github.com/conduitio/conduit-connector-sdk v0.15.0
-	github.com/jackc/pgx/v5 v5.9.2
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/matryer/is v1.4.1
 	github.com/rs/zerolog v1.35.1
 )
